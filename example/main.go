@@ -26,6 +26,14 @@ type readResult struct {
 }
 
 func main() {
+	log.Config(log.ConsoleWriter(true,
+		func(level log.Level, scope string) bool {
+			return level == log.PanicLevel
+		},
+		func(level log.Level, scope string) bool {
+			return scope != "RTP" && scope != "RTSP"
+		}))
+
 	if len(os.Args) < 2 {
 		log.Fatal("First argument must be a RTSP URI")
 	}
