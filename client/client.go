@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/binary"
@@ -16,20 +17,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daneshvar/go-log"
 	"github.com/daneshvar/rtsp/av"
 	"github.com/daneshvar/rtsp/codec"
 	"github.com/daneshvar/rtsp/codec/aacparser"
 	"github.com/daneshvar/rtsp/codec/h264parser"
 	"github.com/daneshvar/rtsp/sdp"
 	"github.com/daneshvar/rtsp/utils/bits/pio"
-	"gitlab.com/behnama2/log"
 )
 
 var ErrCodecDataChange = fmt.Errorf("rtsp: codec data change, please call HandleCodecDataChange()")
 
-var DebugRtp = false
-var DebugRtsp = false
+// var DebugRtp = false
+// var DebugRtsp = false
 var SkipErrRtpBlock = false
+
+var (
+	logRTP  = log.GetScope("RTP")
+	logRTSP = log.GetScope("RTSP")
+)
 
 const (
 	stageDescribeDone = iota + 1
@@ -39,17 +45,17 @@ const (
 )
 
 type Client struct {
-	DebugRtsp bool
-	DebugRtp  bool
-	Headers   []string
+	// DebugRtsp bool
+	// DebugRtp  bool
+	Headers []string
 
 	SkipErrRtpBlock bool
 
-	RtspTimeout          time.Duration
-	RtpTimeout           time.Duration
-	RtpKeepAliveTimeout  time.Duration
-	rtpKeepaliveTimer    time.Time
-	rtpKeepaliveEnterCnt int
+	RtspTimeout         time.Duration
+	RtpTimeout          time.Duration
+	RtpKeepAliveTimeout time.Duration
+	rtpKeepaliveTimer   time.Time
+	// rtpKeepaliveEnterCnt int
 
 	stage int
 
@@ -58,15 +64,15 @@ type Client struct {
 
 	authHeaders func(method string) []string
 
-	url         *url.URL
-	conn        *connWithTimeout
-	brconn      *bufio.Reader
-	requestUri  string
-	cseq        uint
-	streams     []*Stream
-	streamsintf []av.CodecData
-	session     string
-	body        io.Reader
+	url        *url.URL
+	conn       *connWithTimeout
+	brconn     *bufio.Reader
+	requestUri string
+	cseq       uint
+	streams    []*Stream
+	// streamsintf []av.CodecData
+	session string
+	// body        io.Reader
 }
 
 type Request struct {
@@ -84,7 +90,11 @@ type Response struct {
 	Block []byte
 }
 
-func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
+func dial(ctx context.Context, uri string, timeout time.Duration) (self *Client, err error) {
+	if !strings.HasPrefix(uri, "rtsp://") {
+		return nil, fmt.Errorf("RTSP doesn't support protocol: %s", uri)
+	}
+
 	var URL *url.URL
 	if URL, err = url.Parse(uri); err != nil {
 		return
@@ -96,7 +106,7 @@ func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
 
 	dailer := net.Dialer{Timeout: timeout}
 	var conn net.Conn
-	if conn, err = dailer.Dial("tcp", URL.Host); err != nil {
+	if conn, err = dailer.DialContext(ctx, "tcp", URL.Host); err != nil {
 		return
 	}
 
@@ -110,19 +120,21 @@ func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
 		brconn:          bufio.NewReaderSize(connt, 256),
 		url:             URL,
 		requestUri:      u2.String(),
-		DebugRtp:        DebugRtp,
-		DebugRtsp:       DebugRtsp,
 		SkipErrRtpBlock: SkipErrRtpBlock,
 	}
 	return
 }
 
-func Dial(uri string) (self *Client, err error) {
-	if !strings.HasPrefix(uri, "rtsp://") {
-		return nil, fmt.Errorf("RTSP doesn't support protocol: %s", uri)
-	}
+func DialTimeout(uri string, timeout time.Duration) (self *Client, err error) {
+	return dial(context.Background(), uri, timeout)
+}
 
-	return DialTimeout(uri, 0)
+func Dial(uri string) (self *Client, err error) {
+	return dial(context.Background(), uri, 0)
+}
+
+func DialContext(ctx context.Context, uri string) (self *Client, err error) {
+	return dial(ctx, uri, 0)
 }
 
 func (self *Client) allCodecDataReady() bool {
@@ -175,13 +187,13 @@ func (self *Client) prepare(stage int) (err error) {
 	return
 }
 
-func (self *Client) Streams() (streams []av.CodecData, err error) {
+func (self *Client) Streams() (streams []Stream, err error) {
 	if err = self.prepare(stageCodecDataDone); err != nil {
 		return
 	}
 	for _, si := range self.setupIdx {
 		stream := self.streams[si]
-		streams = append(streams, stream.CodecData)
+		streams = append(streams, *stream)
 	}
 	return
 }
@@ -190,11 +202,9 @@ func (self *Client) SendRtpKeepalive() (err error) {
 	if self.RtpKeepAliveTimeout > 0 {
 		if self.rtpKeepaliveTimer.IsZero() {
 			self.rtpKeepaliveTimer = time.Now()
-		} else if time.Now().Sub(self.rtpKeepaliveTimer) > self.RtpKeepAliveTimeout {
+		} else if time.Since(self.rtpKeepaliveTimer) > self.RtpKeepAliveTimeout {
 			self.rtpKeepaliveTimer = time.Now()
-			if self.DebugRtsp {
-				fmt.Println("rtp: keep alive")
-			}
+			logRTSP.Debug("rtp: keep alive")
 			req := Request{
 				Method: "OPTIONS",
 				Uri:    self.requestUri,
@@ -235,9 +245,7 @@ func (self *Client) WriteRequest(req Request) (err error) {
 
 	bufout := buf.Bytes()
 
-	if self.DebugRtsp {
-		fmt.Print("> ", string(bufout))
-	}
+	logRTSP.Debug("> ", string(bufout))
 
 	if _, err = self.conn.Write(bufout); err != nil {
 		return
@@ -277,54 +285,6 @@ func (self *Client) parseBlockHeader(h []byte) (length int, no int, valid bool) 
 				return
 			}
 		}
-	} else { // rtcp
-		// daneshvar.ho
-		//if length < 8 {
-		//	return
-		//}
-		//
-		//// V=2
-		//if h[4]&0xc0 != 0x80 {
-		//	return
-		//}
-		//
-		//stream := self.streams[no/2]
-		//if int(h[5]&0x7f) != stream.Sdp.PayloadType {
-		//	return
-		//}
-		//
-		//timestamp := binary.BigEndian.Uint32(h[8:12])
-		//if stream.firsttimestamp != 0 {
-		//	timestamp -= stream.firsttimestamp
-		//	if timestamp < stream.timestamp {
-		//		return
-		//	} else if timestamp-stream.timestamp > uint32(stream.timeScale()*60*60) {
-		//		return
-		//	}
-		//}
-
-		//log.Println("parseBlockHeader ---------------------------------------------------------------------------")
-		//log.Printf("RTCP len=%d:\n%s", len(h), hex.Dump(h))
-		//
-		//if h[4]&0xc0 != 0x80 {
-		//	return
-		//}
-		//
-		//typ := h[5]&0x1f
-		//switch typ {
-		//	case 7: {
-		//		info, err := h264parser.ParseSPS(h[6:])
-		//		if err != nil {
-		//			log.Printf("Error SPS Parse: %v\n", err)
-		//		} else {
-		//			log.Printf("SPS -> %v\n", info)
-		//		}
-		//	}
-		//	case 8: {
-		//		log.Printf("PPS\n")
-		//	}
-		//}
-		//log.Println("parseBlockHeader ---------------------------------------------------------------------------")
 	}
 
 	valid = true
@@ -469,9 +429,7 @@ func (self *Client) findRTSP() (block []byte, data []byte, err error) {
 			}
 		}
 
-		if false && self.DebugRtp {
-			fmt.Println("rtsp: findRTSP", i, b)
-		}
+		logRTP.Tracev("rtsp: findRTSP", "i", i, "b", b)
 
 		if stat != 0 {
 			peek = append(peek, b)
@@ -482,22 +440,24 @@ func (self *Client) findRTSP() (block []byte, data []byte, err error) {
 		}
 
 		if stat == Dollar && len(peek) >= 12 {
-			if self.DebugRtp {
-				fmt.Println("rtsp: dollar at", i, len(peek))
-			}
+			logRTP.Tracev("rtsp: dollar", "i", i, "len", len(peek))
 			if blocklen, _, ok := self.parseBlockHeader(peek); ok {
 				left := blocklen + 4 - len(peek)
+				if left < 0 {
+					continue
+				}
 				block = append(peek, make([]byte, left)...)
 				if _, err = io.ReadFull(self.brconn, block[len(peek):]); err != nil {
 					return
 				}
+				// TODO: find a better way to sync reading latency
+				time.Sleep(2 * time.Microsecond)
 				return
 			}
 			stat = 0
 			peek = _peek[0:0]
 		}
 	}
-
 	return
 }
 
@@ -552,7 +512,6 @@ func (self *Client) readLFLF() (block []byte, data []byte, err error) {
 
 		pos++
 	}
-
 	return
 }
 
@@ -600,7 +559,6 @@ func (self *Client) poll() (res Response, err error) {
 		}
 		return
 	}
-
 	return
 }
 
@@ -640,6 +598,7 @@ func (self *Client) Setup(idx []int) (err error) {
 
 		uri := ""
 		control := self.streams[si].Sdp.Control
+
 		if strings.HasPrefix(control, "rtsp://") {
 			uri = control
 		} else {
@@ -695,9 +654,7 @@ func (self *Client) Describe() (streams []sdp.Media, err error) {
 
 	body := string(res.Body)
 
-	if self.DebugRtsp {
-		fmt.Println("<", body)
-	}
+	logRTSP.Debug("<", body)
 
 	_, medias := sdp.Parse(body)
 
@@ -780,7 +737,7 @@ func (self *Stream) makeCodecData() (err error) {
 	media := self.Sdp
 
 	// daneshvar.ho PayloadType -> 35-71 Unassigned
-	if (media.PayloadType >= 96 && media.PayloadType <= 127) || (media.PayloadType >= 35 || media.PayloadType <= 71) {
+	if (media.PayloadType >= 96 && media.PayloadType <= 127) || (media.PayloadType >= 35 && media.PayloadType <= 71) {
 		switch media.Type {
 		case av.H264:
 			for _, nalu := range media.SpropParameterSets {
@@ -818,6 +775,9 @@ func (self *Stream) makeCodecData() (err error) {
 				err = fmt.Errorf("rtsp: aac sdp config invalid: %s", err)
 				return
 			}
+			// ToDo: daneshvar.ho
+		case av.ONVIF_METADATA:
+			self.CodecData = codec.NewMetadataCodecData(media.Control)
 		}
 	} else {
 		switch media.PayloadType {
@@ -897,25 +857,36 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 	case naluType == 7: // sps
 		// daneshvar.ho
 		// h := packet
-		// info, err := h264parser.ParseSPS(h)
+		// info, bitPointer, err := h264parser.ParseSPS(h)
 		// if err != nil {
-		// 	log.Errorc(err.Error())
+		// 	log.Error("ParseSPS error:", err)
 		// } else {
-		// 	log.Infov("SPS", "width", info.Width, "height", info.Height)
+		// 	log.Infov("SPS", "Chroma_format_idc", info.Chroma_format_idc, "Seq_scaling_matrix_present_flag", info.Seq_scaling_matrix_present_flag,
+		// 		"Width", info.Width, "Height", info.Height, " vui_prameters_present_flag", info.Vui_prameters_present_flag,
+		// 		", len(packet):", len(packet), ", bitPointer:", bitPointer, "fps", info.FPS)
+		// 	// if info.Vui_prameters_present_flag != 0 {
+		// 	// 	vuiInfo, err := h264parser.ParseVUI(packet, bitPointer)
+		// 	// 	if err != nil {
+		// 	// 		log.Error("ParseSPS error:", err)
+		// 	// 	} else {
+		// 	// 		log.Infov("VUI", "Timing_info_present_flag", vuiInfo.Timing_info_present_flag, "Num_units_in_tick", vuiInfo.Num_units_in_tick, "time scale",
+		// 	// 			vuiInfo.Time_scale, "fps", vuiInfo.Time_scale / vuiInfo.Num_units_in_tick)
+		// 	// 	}
+		// 	// }
 		// }
 		// daneshvar.ho
 
-		if self.client != nil && self.client.DebugRtp {
-			fmt.Println("rtsp: got sps")
+		if self.client != nil {
+			logRTP.Debug("rtsp: got sps")
 		}
 		if len(self.sps) == 0 {
 			self.sps = packet
 			self.makeCodecData()
-			log.Info("RTSP: makeCodecData")
+			// log.Info("RTSP: makeCodecData")
 		} else if bytes.Compare(self.sps, packet) != 0 {
 			self.spsChanged = true
 			self.sps = packet
-			log.Info("RTSP: SPS changed")
+			// log.Info("RTSP: SPS changed")
 
 			// daneshvar.ho
 			self.pkt.IsKeyFrame = false
@@ -924,14 +895,14 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 			self.timestamp = timestamp
 			// daneshvar.ho
 
-			if self.client != nil && self.client.DebugRtp {
-				fmt.Println("rtsp: sps changed")
+			if self.client != nil {
+				logRTP.Debug("rtsp: sps changed")
 			}
 		}
 
 	case naluType == 8: // pps
-		if self.client != nil && self.client.DebugRtp {
-			fmt.Println("rtsp: got pps")
+		if self.client != nil {
+			logRTP.Debug("rtsp: got pps")
 		}
 		if len(self.pps) == 0 {
 			self.pps = packet
@@ -939,8 +910,8 @@ func (self *Stream) handleH264Payload(timestamp uint32, packet []byte) (err erro
 		} else if bytes.Compare(self.pps, packet) != 0 {
 			self.ppsChanged = true
 			self.pps = packet
-			if self.client != nil && self.client.DebugRtp {
-				fmt.Println("rtsp: pps changed")
+			if self.client != nil {
+				logRTP.Debug("rtsp: pps changed")
 			}
 		}
 
@@ -1067,13 +1038,18 @@ func (self *Stream) handleRtpPacket(packet []byte) (err error) {
 		return
 	}
 
-	if self.client != nil && self.client.DebugRtp {
-		fmt.Println("rtp: packet", self.CodecData.Type(), "len", len(packet))
-		dumpsize := len(packet)
-		if dumpsize > 32 {
-			dumpsize = 32
+	if self.client != nil {
+		if self.CodecData != nil {
+			logRTP.Tracev("rtp: packet", "codec", self.CodecData.Type(), "len", len(packet))
+		} else {
+			logRTP.Tracev("rtp: packet", "codec", "none", "len", len(packet))
 		}
-		fmt.Print(hex.Dump(packet[:dumpsize]))
+		// ToDo: daneshvar.ho dump packet data on debug
+		// dumpsize := len(packet)
+		// if dumpsize > 32 {
+		// 	dumpsize = 32
+		// }
+		// fmt.Print(hex.Dump(packet[:dumpsize]))
 	}
 
 	/*
@@ -1160,11 +1136,17 @@ func (self *Stream) handleRtpPacket(packet []byte) (err error) {
 		payload = payload[4:] // TODO: remove this hack
 		self.gotpkt = true
 		self.pkt.Data = payload
+		self.pkt.IsAudio = true
 		self.timestamp = timestamp
-
+	case av.ONVIF_METADATA:
+		self.gotpkt = true
+		self.pkt.IsMetadata = true
+		self.pkt.Data = payload
+		self.timestamp = timestamp
 	default:
 		self.gotpkt = true
 		self.pkt.Data = payload
+		self.pkt.IsAudio = true
 		self.timestamp = timestamp
 	}
 
@@ -1208,9 +1190,7 @@ func (self *Client) Close() (err error) {
 func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error) {
 	_, blockno, _ := self.parseBlockHeader(block)
 	if blockno%2 != 0 {
-		if self.DebugRtp {
-			fmt.Println("rtsp: rtcp block len", len(block)-4)
-		}
+		logRTP.Debugv("rtsp: rtcp block", "len", len(block)-4)
 		return
 	}
 
@@ -1240,22 +1220,24 @@ func (self *Client) handleBlock(block []byte) (pkt av.Packet, ok bool, err error
 		if stream.firsttimestamp == 0 {
 			stream.firsttimestamp = stream.timestamp
 		}
+
+		ts := stream.timestamp
 		stream.timestamp -= stream.firsttimestamp
 
 		ok = true
 		pkt = stream.pkt
 		pkt.Time = time.Duration(stream.timestamp) * time.Second / time.Duration(stream.timeScale())
 		pkt.Idx = int8(self.setupMap[i])
+		pkt.TimeSample = ts - stream.lastTimeSample
 
 		if pkt.Time < stream.lasttime || pkt.Time-stream.lasttime > time.Minute*30 {
 			err = fmt.Errorf("rtp: time invalid stream#%d time=%v lasttime=%v", pkt.Idx, pkt.Time, stream.lasttime)
 			return
 		}
 		stream.lasttime = pkt.Time
+		stream.lastTimeSample = ts
 
-		if self.DebugRtp {
-			fmt.Println("rtp: pktout", pkt.Idx, pkt.Time, len(pkt.Data))
-		}
+		logRTP.Tracev("rtp: pktout", "index", pkt.Idx, "time", pkt.Time, "len", len(pkt.Data))
 
 		stream.pkt = av.Packet{}
 		stream.gotpkt = false
@@ -1288,8 +1270,6 @@ func (self *Client) readPacket() (pkt av.Packet, err error) {
 			return
 		}
 	}
-
-	return
 }
 
 func (self *Client) ReadPacket() (pkt av.Packet, err error) {
