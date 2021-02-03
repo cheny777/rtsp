@@ -122,7 +122,7 @@ const ADTSHeaderLength = 7
 
 func FillADTSHeader(header []byte, config MPEG4AudioConfig, samples int, payloadLength int) {
 	payloadLength += 7
-	//AAAAAAAA AAAABCCD EEFFFFGH HHIJKLMM MMMMMMMM MMMOOOOO OOOOOOPP (QQQQQQQQ QQQQQQQQ)
+	// AAAAAAAA AAAABCCD EEFFFFGH HHIJKLMM MMMMMMMM MMMOOOOO OOOOOOPP (QQQQQQQQ QQQQQQQQ)
 	header[0] = 0xff
 	header[1] = 0xf1
 	header[2] = 0x50
@@ -130,9 +130,9 @@ func FillADTSHeader(header []byte, config MPEG4AudioConfig, samples int, payload
 	header[4] = 0x43
 	header[5] = 0xff
 	header[6] = 0xcd
-	//config.ObjectType = uint(frames[2]>>6)+1
-	//config.SampleRateIndex = uint(frames[2]>>2&0xf)
-	//config.ChannelConfig = uint(frames[2]<<2&0x4|frames[3]>>6&0x3)
+	// config.ObjectType = uint(frames[2]>>6)+1
+	// config.SampleRateIndex = uint(frames[2]>>2&0xf)
+	// config.ChannelConfig = uint(frames[2]<<2&0x4|frames[3]>>6&0x3)
 	header[2] = (byte(config.ObjectType-1)&0x3)<<6 | (byte(config.SampleRateIndex)&0xf)<<2 | byte(config.ChannelConfig>>2)&0x1
 	header[3] = header[3]&0x3f | byte(config.ChannelConfig&0x3)<<6
 	header[3] = header[3]&0xfc | byte(payloadLength>>11)&0x3
